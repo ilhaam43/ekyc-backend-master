@@ -10,7 +10,7 @@ export class Customers {
     const row = await trx('platform_customers').where({ id, tenant_id: actor.tenant_id }).whereNull('deleted_at').first(); assert(row, 404, 'CUSTOMER_NOT_FOUND'); return row;
   }
   async get(actor, id) {
-    const row = await this.row(actor, id); const data = await this.encryption.transform('decrypt', await this.tenant(actor.tenant_id), row.data);
+    const row = await this.row(actor, id); const data = await this.encryption.transform('decrypt', await this.tenant(actor.tenant_id), row.data, row.id, row.encryption_format);
     return { ...data, id: row.id, actor_id: row.actor_id, application_id: row.tenant_id, verification_status: row.verification_status, created_at: row.created_at, updated_at: row.updated_at };
   }
   async create(actor, data) {
@@ -19,8 +19,9 @@ export class Customers {
     const tenant = await this.tenant(actor.tenant_id);
     const { id = randomUUID(), actor_id: actorId, ...fields } = data;
     if (actorId) assert(await this.db('platform_actors').where({ id: actorId, tenant_id: actor.tenant_id }).first(), 404, 'ACTOR_NOT_FOUND');
-    const encrypted = await this.encryption.transform('encrypt', tenant, fields);
-    await this.db.transaction(async trx => { await trx('platform_customers').insert({ id, tenant_id: actor.tenant_id, actor_id: actorId, data: encrypted, encryption_format: this.encryption.cfg.encryptionMock ? 'synthetic-plaintext' : 'legacy-v1' }); await audit(trx, actor.tenant_id, actorId, id, 'customer.created'); });
+    const encrypted = await this.encryption.transform('encrypt', tenant, fields, id);
+    const encryption_format = this.encryption.cfg.platformEncryptionUrl ? 'ekyc-aes-256-gcm-v1' : this.encryption.cfg.encryptionMock ? 'synthetic-plaintext' : 'legacy-v1';
+    await this.db.transaction(async trx => { await trx('platform_customers').insert({ id, tenant_id: actor.tenant_id, actor_id: actorId, data: encrypted, encryption_format }); await audit(trx, actor.tenant_id, actorId, id, 'customer.created'); });
     return this.get(actor, id);
   }
   async update(actor, id, changes) {
@@ -29,9 +30,9 @@ export class Customers {
     const tenant = await this.tenant(actor.tenant_id);
     await this.db.transaction(async trx => {
       const row = await trx('platform_customers').where({ id, tenant_id: actor.tenant_id }).whereNull('deleted_at').forUpdate().first(); assert(row, 404, 'CUSTOMER_NOT_FOUND');
-      const plain = await this.encryption.transform('decrypt', tenant, row.data);
-      const encrypted = await this.encryption.transform('encrypt', tenant, { ...plain, ...changes });
-      await trx('platform_customers').where({ id }).update({ data: encrypted, updated_at: new Date() });
+      const plain = await this.encryption.transform('decrypt', tenant, row.data, row.id, row.encryption_format);
+      const encrypted = await this.encryption.transform('encrypt', tenant, { ...plain, ...changes }, row.id);
+      await trx('platform_customers').where({ id }).update({ data: encrypted, ...(this.encryption.cfg.platformEncryptionUrl ? { encryption_format: 'ekyc-aes-256-gcm-v1' } : {}), updated_at: new Date() });
       await audit(trx, actor.tenant_id, actor.sub, id, 'customer.updated', { fields: Object.keys(changes) });
     }); return this.get(actor, id);
   }

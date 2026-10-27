@@ -1,3 +1,7 @@
+import { sealDevelopmentMaterial } from './development-transactions.js';
+import { platformCrypt } from '@ekyc/shared/platform-crypto';
+import { LegacyCalls } from './legacy-calls.js';
+import { CustomerDeletion } from './deletion.js';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import multer from 'multer';
@@ -11,6 +15,7 @@ import { Customers } from './customers.js';
 import { Providers, legacyProviderRoutes } from './providers.js';
 export function createApp(db, cfg, storage, providers = new Providers()) {
   const app = baseApp(cfg, db); const encryption = new Encryption(cfg); const customers = new Customers(db, encryption);
+  const legacy = new LegacyCalls(db, cfg, customers), deletion = new CustomerDeletion(db, cfg, storage);
   const member = auth(cfg, db); const partner = gateway(cfg);
   const actor = (req, res, next) => req.headers.authorization ? member(req, res, next) : partner(req, res, next);
   const send = (res, data) => res.json({ success: true, data });
@@ -31,28 +36,33 @@ export function createApp(db, cfg, storage, providers = new Providers()) {
   app.put(`${root}/users/:id`, body('customer'), async (req, res) => send(res, await customers.update(req.auth, req.params.id, req.body)));
   app.post(`${root}/users/:id`, body('customer'), async (req, res) => send(res, await customers.update(req.auth, req.params.id, req.body)));
   app.post(`${root}/users/softdelete/:id`, async (req, res) => { await customers.remove(req.auth, req.params.id); send(res, null); });
-  app.delete(`${root}/users/:id`, (_req, res) => res.status(409).json({ success: false, error: { code: 'RETENTION_POLICY_REQUIRED', message: 'Use soft deletion. Permanent deletion requires an audited retention policy.' } }));
-  for (const action of ['verify', 'reject']) app.put(`${root}/users/:id/${action}`, (_req, res) => res.status(409).json({ success: false, error: { code: 'USE_RECORDED_CALL_DECISION' } }));
+  app.delete(`${root}/users/:id`, async (req, res) => { const result = await deletion.request(req.auth, req.params.id); res.status(result.state === 'purged' ? 200 : 202); send(res, result); });
+  app.get(`${root}/users/:id/deletion`, async (req, res) => send(res, await deletion.status(req.auth, req.params.id)));
+  for (const [action, outcome] of [['verify', 'verified'], ['reject', 'not_verified']]) app.put(`${root}/users/:id/${action}`, async (req, res) => send(res, await legacy.decide(req.auth, req.params.id, req.body || {}, outcome, req.headers.authorization)));
   app.put(`${root}/users/:id/face-verification`, async (req, res) => { assert(req.auth.role === 'partner', 403, 'PARTNER_REQUIRED'); const { score, epsilon } = req.body; assert([score, epsilon].every(x => typeof x === 'number' && x >= 0 && x <= 1), 422, 'INVALID_FACE_SCORE'); send(res, await customers.update(req.auth, req.params.id, { face_verification_score: score, face_verification_epsilon: epsilon })); });
   app.post(`${root}/actors`, async (req, res) => { assert(req.auth.role === 'partner', 403, 'PARTNER_REQUIRED'); const [row] = await db('platform_actors').insert({ id: randomUUID(), tenant_id: req.auth.tenant_id }).returning('*'); send(res, row); });
-  app.get(`${root}/actors/:id/apikey`, (_req, res) => res.status(410).json({ success: false, error: { code: 'USE_SCOPED_CUSTOMER_GRANTS' } }));
+  app.get(`${root}/actors/:id/apikey`, loginLimiter(), async (req, res) => { res.set('cache-control', 'no-store'); send(res, await legacy.actorCredential(req.auth, req.params.id, req.query.user_id)); });
   app.get(`${root}/options/:category`, async (req, res) => send(res, (await db('platform_reference').where({ category: req.params.category })).map(row => ({ id: row.id, ...row.data }))));
   app.get(`${root}/postal/search`, async (req, res) => send(res, (await db('platform_reference').where({ category: 'postal' }).whereRaw('data::text ILIKE ?', [`%${String(req.query.q || '').slice(0, 100)}%`]).limit(20)).map(row => ({ id: row.id, ...row.data }))));
   app.get(`${root}/postal/:id`, async (req, res) => { const row = await db('platform_reference').where({ category: 'postal', id: req.params.id }).first(); assert(row, 404, 'POSTAL_NOT_FOUND'); send(res, { id: row.id, ...row.data }); });
   app.get(`${root}/skip-otp`, (_req, res) => res.json({ skip_otp: 0 }));
   app.post(`${root}/quota/videocalls`, async (req, res) => { const row = await db('platform_quotas').where({ tenant_id: req.auth.tenant_id, service: 'videocalls.post' }).first(); send(res, { quotaRemaining: row?.remaining || 0 }); });
-  app.post(`${root}/videocalls`, (_req, res) => res.status(409).json({ success: false, error: { code: 'USE_CALL_REGISTER', message: 'Register with /v1/calls/register and an Idempotency-Key.' } }));
+  app.post(`${root}/videocalls`, body('register'), async (req, res) => send(res, await legacy.register(req.auth, req.body, req.headers['idempotency-key'])));
   app.post(`${root}/audit-trail`, async (req, res) => { assert(req.auth.role === 'partner', 403, 'PARTNER_REQUIRED'); assert(typeof req.body.action === 'string' && req.body.action.length <= 100, 422, 'ACTION_REQUIRED'); await audit(db, req.auth.tenant_id, null, null, `partner.${req.body.action}`); send(res, null); });
   app.get(`${root}/audit-trail`, async (req, res) => { assert(req.auth.role !== 'customer', 403, 'FORBIDDEN'); send(res, await db('platform_audit').where({ tenant_id: req.auth.tenant_id }).orderBy('id', 'desc').limit(100)); });
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 4 } });
   app.post(`${root}/document`, upload.single('file'), async (req, res) => {
     assert(req.auth.role !== 'customer', 403, 'FORBIDDEN'); await customers.row(req.auth, req.body.user_id);
     assert(req.file && typeof req.body.type === 'string' && /^[a-z0-9_-]{1,40}$/i.test(req.body.type), 422, 'INVALID_DOCUMENT');
+    const uploaded = await db.transaction(async trx => {
+    await trx('platform_customers').where({ id: req.body.user_id, tenant_id: req.auth.tenant_id }).forUpdate().first().then(row => assert(row && !row.deleted_at, 404, 'CUSTOMER_NOT_FOUND'));
     const bytes = req.file.buffer; const png = bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])); const jpeg = bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255; const pdf = bytes.subarray(0, 5).toString() === '%PDF-';
     assert(png || jpeg || pdf, 422, 'UNSUPPORTED_DOCUMENT'); const mimetype = png ? 'image/png' : jpeg ? 'image/jpeg' : 'application/pdf';
     const id = randomUUID(); const key = `${req.auth.tenant_id}/${req.body.user_id}/${id}`;
     await storage.put(cfg.documentBucket, key, bytes, mimetype, { sha256: hash(bytes) });
-    try { const [doc] = await db('platform_documents').insert({ id, tenant_id: req.auth.tenant_id, user_id: req.body.user_id, type: req.body.type, object_key: key, bucket: cfg.documentBucket, mimetype, bytes: bytes.length, sha256: hash(bytes) }).returning('*'); send(res, { id: doc.id, type: doc.type, mimetype: doc.mimetype, path: doc.id }); } catch (e) { await storage.delete(cfg.documentBucket, key); throw e; }
+    try { const [doc] = await trx('platform_documents').insert({ id, tenant_id: req.auth.tenant_id, user_id: req.body.user_id, type: req.body.type, object_key: key, bucket: cfg.documentBucket, mimetype, bytes: bytes.length, sha256: hash(bytes) }).returning('*'); return { id: doc.id, type: doc.type, mimetype: doc.mimetype, path: doc.id }; } catch (e) { await storage.delete(cfg.documentBucket, key); throw e; }
+    });
+    send(res, uploaded);
   });
   app.get(`${root}/document/:userId`, async (req, res) => { await customers.row(req.auth, req.params.userId); send(res, (await db('platform_documents').where({ tenant_id: req.auth.tenant_id, user_id: req.params.userId })).map(doc => ({ id: doc.id, type: doc.type, mimetype: doc.mimetype, path: doc.id }))); });
   app.get(`${root}/document/:userId/:id`, async (req, res) => {
@@ -73,8 +83,17 @@ export function createApp(db, cfg, storage, providers = new Providers()) {
   app.post(`${root}/otp/resend`, loginLimiter(), async (req, res) => { const otp = await db('platform_otps').where({ id: req.body.pin_id, tenant_id: req.auth.tenant_id }).where('expires_at', '>', new Date()).whereNull('verified_at').first(); assert(otp, 422, 'OTP_EXPIRED'); await customers.row(req.auth, otp.user_id); send(res, await providers.execute(req.auth.tenant_id, 'infobip', 'resend', { pin_id: otp.id })); });
   app.post(`${root}/secure-transactions`, async (req, res) => {
     assert(req.auth.role === 'partner', 403, 'PARTNER_REQUIRED'); const tenant = await customers.tenant(req.auth.tenant_id); const material = { key: randomBytes(32).toString('base64'), iv: randomBytes(16).toString('base64') };
-    const keys = await encryption.keys(tenant); const encrypted = await encryption.request('encrypt', { key: keys.encryption_key, IV: keys.iv, data: material });
-    const id = randomUUID(); const expires_at = new Date(Date.now() + 86400000); await db('platform_secure_transactions').insert({ id, tenant_id: tenant.id, encrypted_material: encrypted, expires_at }); res.set('cache-control', 'no-store'); send(res, { id, ...material, expired_at: expires_at });
+    const id = randomUUID(), expires_at = new Date(Date.now() + 86400000);
+    let encrypted;
+    if (cfg.platformEncryptionUrl) encrypted = await platformCrypt(cfg, 'encrypt', tenant.id, 'secure-transaction', id, material);
+    else if (cfg.encryptionMock) encrypted = sealDevelopmentMaterial(cfg, { id, tenant_id: tenant.id, expires_at }, material);
+    else { const keys = await encryption.keys(tenant); encrypted = await encryption.request('encrypt', { key: keys.encryption_key, IV: keys.iv, data: material }); }
+    const encryption_mode = cfg.platformEncryptionUrl ? 'platform-service' : cfg.encryptionMock ? 'development-mock' : 'external-service';
+    await db.transaction(async trx => {
+      await trx('platform_secure_transactions').insert({ id, tenant_id: tenant.id, encrypted_material: encrypted, expires_at });
+      await audit(trx, tenant.id, req.auth.sub || null, null, 'secure_transaction.created', { id, encryption_mode });
+    });
+    res.set({ 'cache-control': 'no-store', 'x-ekyc-encryption-mode': encryption_mode }); send(res, { id, ...material, expired_at: expires_at, encryption_mode });
   });
   for (const [method, path, provider, operation] of legacyProviderRoutes) app[method](`${root}${path}`, async (req, res) => { assert(req.auth.role === 'partner', 403, 'PARTNER_REQUIRED'); send(res, await providers.execute(req.auth.tenant_id, provider, operation, { ...req.query, ...req.body, ...req.params }, req.headers['idempotency-key'])); });
   app.post(`${root}/callback`, async (req, res) => {
@@ -82,6 +101,6 @@ export function createApp(db, cfg, storage, providers = new Providers()) {
     await db.transaction(async trx => { for (const data of rows) { assert(typeof data.submissionId === 'string' && typeof data.status === 'string', 422, 'INVALID_CALLBACK'); await trx('platform_callbacks').insert({ id: randomUUID(), tenant_id: req.auth.tenant_id, provider: 'onekyc', submission_id: data.submissionId, event_hash: hash(JSON.stringify(data)), data }).onConflict(['tenant_id', 'provider', 'event_hash']).ignore(); } }); send(res, { accepted: rows.length });
   });
   app.get(`${root}/callback`, async (req, res) => { assert(req.auth.role === 'partner', 403, 'PARTNER_REQUIRED'); send(res, (await db('platform_callbacks').where({ tenant_id: req.auth.tenant_id }).orderBy('created_at', 'desc').limit(100)).map(x => x.data)); });
-  app.locals.customers = customers;
+  app.locals.customers = customers; app.locals.deletion = deletion;
   return finishApp(app);
 }
